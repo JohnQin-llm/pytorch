@@ -1430,6 +1430,10 @@ TRACE FX call mul from test_logging.py:N in fn (LoggingTests.test_trace_call_pre
         )
 
     def test_logs_out(self):
+        from torch.testing._internal.common_utils import getRocmVersion, TEST_WITH_ROCM
+
+        if TEST_WITH_ROCM and getRocmVersion()[:2] == (10, 2):
+            self.skipTest("unexpected kineto warnings on ROCm 10.2")
         import tempfile
 
         with tempfile.NamedTemporaryFile(delete=True) as tmp:
