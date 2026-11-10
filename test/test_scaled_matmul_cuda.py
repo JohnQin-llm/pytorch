@@ -959,6 +959,7 @@ class TestFP8MatmulDevice(TestCase, _TestFP8MatmulMixin):
             self._test_tautological_mm(device, size=64, out_dtype=torch.bfloat16, x_cm=True, y_cm=False)
 
 
+
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, f8_msg)
     def test_float8_basics_invalid_out_dtype(self, device) -> None:
         with self.assertRaises(
@@ -3349,7 +3350,7 @@ class TestFP8MatmulDevice(TestCase, _TestFP8MatmulMixin):
         swizzle = SwizzleType.SWIZZLE_128 if evaluate_gfx_arch_within(["gfx1250"]) else SwizzleType.SWIZZLE_32_8
         swizzle_name = "SWIZZLE_128" if swizzle == SwizzleType.SWIZZLE_128 else "SWIZZLE_32_8"
         with self.subTest(swizzle=swizzle_name, mkn=(32, 16, 32)):
-            with self.assertRaisesRegex(ValueError, f"K must be a multiple of 32 for {swizzle_name}"):
+            with self.assertRaisesRegex(ValueError, f"K must be a multiple of 32 for (gfx1250 MX FP4 )?{swizzle_name}"):
                 ones_mm(32, 16, 32, swizzle)
         with self.subTest(swizzle=swizzle_name, mkn=(8, 32, 16)):
             # N stays a multiple of 16: _scaled_mm_v2 requires that of mat2
@@ -3518,7 +3519,10 @@ class TestFP8MatmulDevice(TestCase, _TestFP8MatmulMixin):
         sqnr = compute_error(C_ref, C).item()
         self.assertGreater(sqnr, sqnr_target, f"SWIZZLE_128 gave sqnr {sqnr}")
 
-        with self.assertRaisesRegex(NotImplementedError, "gfx1250 MX block scaling requires SWIZZLE_128"):
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            r"requires SWIZZLE_128 scales\. Pass swizzle_a=swizzle_b=SwizzleType\.SWIZZLE_128",
+        ):
             scaled_mm(
                 A, B.t(),
                 A_scale, ScalingType.BlockWise1x32,
@@ -4537,7 +4541,7 @@ torch.cuda.synchronize()
         y_scale = torch.full((N, K // 32), 1., dtype=torch.float8_e8m0fnu, device=device)
 
         # K=128 makes the gfx1250 order a no-op, so these linear scales are
-        # already a valid SWIZZLE_32_8 buffer. gfx1250 rejects NO_SWIZZLE.
+        # already a valid SWIZZLE_128 buffer. gfx1250 rejects NO_SWIZZLE.
         # gfx950 still accepts it.
         gfx1250_swizzle = {}
         if evaluate_gfx_arch_within(["gfx1250"]):
@@ -4744,10 +4748,12 @@ torch.cuda.synchronize()
 
         global_scale = torch.full((1, ), 1., dtype=torch.float, device=device)
 
+        rocm_swizzle_count_msg = "swizzle_a/swizzle_b must match the number of scale recipes"
+
         # No swizzles passed - must fail on swizzle_a
         with self.assertRaisesRegex(
-            NotImplementedError if torch.version.hip else ValueError,
-            "NVFP4 scaling not supported on ROCM"
+            ValueError,
+            rocm_swizzle_count_msg
             if torch.version.hip
             else "swizzle_a must have 2 values, got 0",
         ):
@@ -4762,8 +4768,8 @@ torch.cuda.synchronize()
 
         # Not enough swizzles passed - must fail on swizzle_a
         with self.assertRaisesRegex(
-            NotImplementedError if torch.version.hip else ValueError,
-            "NVFP4 scaling not supported on ROCM"
+            ValueError,
+            rocm_swizzle_count_msg
             if torch.version.hip
             else "swizzle_a must have 2 values, got 1",
         ):
@@ -4779,8 +4785,8 @@ torch.cuda.synchronize()
 
         # Not enough swizzles passed to b - must fail on swizzle_b
         with self.assertRaisesRegex(
-            NotImplementedError if torch.version.hip else ValueError,
-            "NVFP4 scaling not supported on ROCM"
+            ValueError,
+            rocm_swizzle_count_msg
             if torch.version.hip
             else "swizzle_b must have 2 values, got 1",
         ):
