@@ -27,6 +27,7 @@ from torch._inductor.exc import InductorError
 from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import timed
 from torch._prims_common import is_float_dtype
+from torch.autograd.functional import vjp
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.nn import functional as F
 from torch.testing._internal.common_utils import (
@@ -3175,6 +3176,20 @@ class CPUReproTests(TestCase):
         assert metrics.cpp_to_dtype_count == 2
         check_metrics_vec_kernel_count(1)
 
+    def test_emulate_precision_casts_explicit_lowp_round_trip(self):
+        # An explicit fp32->fp16->fp32 round-trip must keep its intermediate
+        # rounding under emulate_precision_casts. The CPU codegen used to collapse
+        # it via the reverse lowp-fp->fp32 CSE cache (populated at to_dtype time),
+        # silently dropping the fp16 rounding. See issue #185337.
+        def fn(x):
+            y = x.to(torch.float16).to(torch.float32)
+            return y, y.sum(dim=1)
+
+        x = torch.arange(20, dtype=torch.float32).reshape(5, 4).t() / 7.0
+        with config.patch({"emulate_precision_casts": True}):
+            torch._dynamo.reset()
+            self.common(fn, (x,))
+
     def test_memory_copy_with_fusion(self):
         def fn(x):
             res = x.relu()
@@ -4509,6 +4524,60 @@ class CPUReproTests(TestCase):
         torch.testing.assert_close(x_cmp.grad, x_ref.grad)
         torch.testing.assert_close(weight_cmp.grad, weight_ref.grad)
         torch.testing.assert_close(bias_cmp.grad, bias_ref.grad)
+
+    @config.patch(emulate_precision_casts=True)
+    def test_emulate_precision_casts_cpp_backend_no_error(self):
+        """
+        See https://github.com/pytorch/pytorch/issues/167205
+        emulate_precision_casts threw TypeError on CPP backend.
+
+        Before fix: TypeError: CppVecOverrides.to_dtype() got an unexpected
+        keyword argument 'use_compute_types'
+
+        After fix: Should compile and run without error.
+        """
+
+        def robust_power(base, exponent, threshold):
+            threshold1 = threshold
+            broadcasted_base = torch.abs(base)
+            threshold_bc = threshold.expand_as(base)
+            cond = broadcasted_base < threshold_bc
+            return torch.where(cond, base / threshold1, base**exponent)
+
+        device = torch.device("cpu")
+        base = torch.randn(10, dtype=torch.float16, device=device)
+        exponent = torch.tensor(2.0, dtype=torch.float16, device=device)
+        threshold = torch.tensor(0.01, dtype=torch.float16, device=device)
+        v = torch.ones_like(base)
+
+        # Main test, this should not raise TypeError (before fix it would)
+        compiled_fn = torch.compile(robust_power)
+        y, (grad_b, grad_e, grad_t) = vjp(
+            lambda b, e, t: compiled_fn(b, e, t), (base, exponent, threshold), v=v
+        )
+
+        # Sanity check that gradients were computed
+        self.assertIsNotNone(grad_b)
+        self.assertEqual(grad_b.dtype, torch.float16)
+
+    @config.patch(emulate_precision_casts=True)
+    def test_emulate_precision_casts_preserves_fused_fp16_rounding(self):
+        def fn(x, c):
+            z = torch.where(c, torch.full_like(x, 0.5), torch.full_like(x, -0.5))
+            y = z.to(torch.float16) + x.to(torch.float16)
+            return y, y.float().sum()
+
+        x = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4) / 10
+        c = (torch.arange(24) % 5 == 0).reshape(2, 3, 4)
+        expected = fn(x, c)
+
+        for simdlen in simd_lengths_to_test():
+            with config.patch({"cpp.simdlen": simdlen}):
+                torch._dynamo.reset()
+                metrics.reset()
+                actual = torch.compile(fn, backend="inductor", fullgraph=True)(x, c)
+                self.assertEqual(actual[0], expected[0])
+                self.assertEqual(actual[1], expected[1])
 
     def test_int_div_vec(self):
         def fn(x, y, mode):

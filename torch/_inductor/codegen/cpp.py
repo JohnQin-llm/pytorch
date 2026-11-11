@@ -709,7 +709,12 @@ class CppOverrides(OpOverrides):
         expr = V.kernel.get_to_dtype_expr(x, dtype, src_dtype)
         csevar = V.kernel.cse.generate(V.kernel.compute, expr)
         csevar.update_on_args("to_dtype", (x, dtype), {"src_dtype": src_dtype})
-        if dtype in DTYPE_LOWP_FP and src_dtype == torch.float:
+        if (
+            use_compute_types
+            and dtype in DTYPE_LOWP_FP
+            and src_dtype == torch.float
+            and not config.emulate_precision_casts
+        ):
             """
             https://github.com/pytorch/pytorch/issues/115260
             For FusedSchedulerNode[node1, node2], the node2 loads what node1 stores and the buffer is
@@ -740,6 +745,10 @@ class CppOverrides(OpOverrides):
                 store(buf, node1_output_lowp)
                 node2_input_lowp = node_output_lowp # hit store cache
                 node2_input = node1_output # hit cse cache
+
+            This cache trick skips the lowp->fp32 round-trip rounding, so it is
+            disabled under emulate_precision_casts, where that rounding must be
+            preserved (e.g. an explicit fp32->fp16->fp32 user cast). See #185337.
             """
             V.kernel.cache_dtype_convert(x, src_dtype, csevar, dtype)
         return csevar
@@ -1632,7 +1641,7 @@ class CppVecOverrides(CppOverrides):
         return code
 
     @staticmethod
-    def to_dtype(x, dtype, src_dtype=None, use_compute_dtypes=True):
+    def to_dtype(x, dtype, src_dtype=None, use_compute_types=True):
         assert dtype in [
             torch.bool,
             torch.float64,
@@ -1651,7 +1660,12 @@ class CppVecOverrides(CppOverrides):
         expr = V.kernel.get_to_dtype_expr(x, dtype, src_dtype)
         csevar = V.kernel.cse.generate(V.kernel.compute, expr)
         csevar.update_on_args("to_dtype", (x, dtype), {"src_dtype": src_dtype})
-        if dtype in DTYPE_LOWP_FP and src_dtype == torch.float:
+        if (
+            use_compute_types
+            and dtype in DTYPE_LOWP_FP
+            and src_dtype == torch.float
+            and not config.emulate_precision_casts
+        ):
             V.kernel.cache_dtype_convert(x, src_dtype, csevar, dtype)
         return csevar
 
