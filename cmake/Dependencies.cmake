@@ -1154,6 +1154,14 @@ if(USE_ROCM)
     # Use host linker instead of device linker (no relocatable device code by default)
     string(APPEND CMAKE_HIP_FLAGS " -fno-gpu-rdc")
 
+    # gfx1250: avoid packed BF16 instructions when the compiler lacks
+    # llvm/llvm-project#209861; see ROCmGfx1250PackedBF16.cmake.
+    include(${CMAKE_CURRENT_LIST_DIR}/ROCmGfx1250PackedBF16.cmake)
+    torch_rocm_gfx1250_bf16_pk_check("${PYTORCH_ROCM_ARCH}" "${CMAKE_HIP_COMPILER}")
+    if(TORCH_ROCM_GFX1250_NO_BF16_PK)
+      string(APPEND CMAKE_HIP_FLAGS " -Xclang -target-feature -Xclang -bf16-pk-insts")
+    endif()
+
     set(Caffe2_HIP_INCLUDE
        $<INSTALL_INTERFACE:include> ${Caffe2_HIP_INCLUDE})
 
