@@ -37,7 +37,10 @@ from torch._prims_common import (
     suggest_memory_format,
     type_to_dtype,
 )
-from torch._refs import native_layer_norm as decomp_native_layer_norm
+from torch._refs import (
+    native_group_norm as decomp_native_group_norm,
+    native_layer_norm as decomp_native_layer_norm,
+)
 from torch.fx.experimental.symbolic_shapes import (
     guard_or_false,
     statically_known_true,
@@ -128,6 +131,7 @@ decomps_to_exclude: list[torch._ops.OpOverload | torch._ops.OpOverloadPacket] = 
     aten.clamp_min,
     aten.embedding_dense_backward,  # we fall back on xpu
     aten.native_layer_norm,  # we fall back on mtia
+    aten.native_group_norm,  # inductor re-registers with a channels-last GPU path
     aten.index_add,  # we conditionally call this decomp
     aten.glu,  # inductor lowers this directly
     aten.select_scatter,  # need to be in the ATen graph in order for it to work with the re-inplacing pass
@@ -323,6 +327,63 @@ def _native_layer_norm(
         return NotImplemented
     # We can write a util function to update decomp table if we have more ops to fallback.
     return decomp_native_layer_norm(input, normalized_shape, weight, bias, eps)
+
+
+@register_decomposition(aten.native_group_norm)
+def _native_group_norm(
+    input: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    N: int,
+    C: int,
+    HxW: int,
+    group: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # The reference decomposition reduces each group over [C // group, HxW]. For a
+    # channels-last input those elements are C apart in memory, so on GPUs this
+    # becomes an uncoalesced inner reduction (each split reads a few bytes per
+    # cache line). Instead, compute per-channel statistics over the spatial dims
+    # (an outer reduction whose loads are contiguous along C), then merge the
+    # C // group channels of each group. All channels have HxW elements, so
+    # var_g = mean_c(var_c) + mean_c((mean_c - mean_g) ** 2).
+    # This needs a few more kernels, so only use it when the statistics reduction
+    # is large (per-group size or total size); small inputs are launch-bound.
+    mem_fmt = suggest_memory_format(input)
+    if (
+        not is_gpu(input.device.type)
+        or mem_fmt == torch.contiguous_format
+        or not guard_or_false(C % group == 0)
+        or not (
+            statically_known_true(HxW * (C // group) >= 2**16)
+            or statically_known_true(N * C * HxW >= 2**24)
+        )
+    ):
+        return decomp_native_group_norm(input, weight, bias, N, C, HxW, group, eps)
+
+    computation_dtype = utils.get_computation_dtype(input.dtype)
+    x = input.to(computation_dtype)
+    var_c, mean_c = torch.var_mean(x, dim=list(range(2, x.ndim)), correction=0)
+    mean_c = mean_c.view(N, group, C // group)
+    var_c = var_c.view(N, group, C // group)
+    mean = mean_c.mean(dim=-1, keepdim=True)
+    var = (var_c + (mean_c - mean).square()).mean(dim=-1, keepdim=True)
+    rstd = torch.rsqrt(var + eps)
+
+    bcast = [N, C] + [1] * (x.ndim - 2)
+    mean_b = mean.expand(N, group, C // group).reshape(bcast)
+    rstd_b = rstd.expand(N, group, C // group).reshape(bcast)
+    out = (x - mean_b) * rstd_b
+    if weight is not None:
+        out = out * weight.reshape([1, C] + [1] * (x.ndim - 2))
+    if bias is not None:
+        out = out + bias.reshape([1, C] + [1] * (x.ndim - 2))
+    out = out.to(input.dtype).contiguous(memory_format=mem_fmt)
+    return (
+        out,
+        mean.view(N, group).to(input.dtype),
+        rstd.view(N, group).to(input.dtype),
+    )
 
 
 @register_decomposition([aten.sym_constrain_range_for_size.default])

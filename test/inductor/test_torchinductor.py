@@ -8316,6 +8316,41 @@ for dtype in (torch.int32, torch.int64):
         o2 = torch.compile(mod)(inp)
         self.assertEqual(o1, o2, rtol=1e-3, atol=1e-3)
 
+    def test_native_group_norm_channels_last(self):
+        # On GPU, large channels-last group_norm is decomposed into per-channel
+        # statistics merged per group; check out/mean/rstd and the out layout.
+        def fn(x, w, b):
+            return torch.ops.aten.native_group_norm(
+                x, w, b, x.shape[0], x.shape[1], math.prod(x.shape[2:]), 4, 1e-5
+            )
+
+        cases = [
+            ((2, 16, 8, 8), torch.channels_last),
+            ((2, 16, 3, 4, 5), torch.channels_last_3d),
+        ]
+        if self.device == GPU_TYPE:
+            # large enough to take the per-channel statistics path
+            cases += [
+                ((2, 64, 64, 64), torch.channels_last),
+                ((2, 32, 16, 32, 32), torch.channels_last_3d),
+            ]
+        for shape, fmt in cases:
+            x = (torch.randn(shape) * 3 + 5).to(memory_format=fmt)
+            w = torch.randn(shape[1])
+            b = torch.randn(shape[1])
+            self.common(fn, (x, w, b), exact_stride=True)
+            self.common(fn, (x, None, None), exact_stride=True)
+
+        if self.device == GPU_TYPE:
+            # The statistics should come from an outer reduction over the spatial
+            # dims (loads contiguous along C), not a reduction over strided groups.
+            x = torch.randn(2, 64, 64, 64, device=self.device).to(
+                memory_format=torch.channels_last
+            )
+            w = torch.randn(64, device=self.device)
+            _, code = run_and_get_code(torch.compile(fn, dynamic=False), x, w, w)
+            FileCheck().check("ReductionHint.OUTER").run(code[0])
+
     @patch.object(config.trace, "enabled", True)
     def test_layer_norm(self):
         m = torch.nn.Sequential(
