@@ -3313,6 +3313,43 @@ class TestFP8MatmulDevice(TestCase, _TestFP8MatmulMixin):
 
     @onlyAccelerator
     @unittest.skipIf(not PLATFORM_SUPPORTS_MX_GEMM, mx_skip_msg)
+    @unittest.skipIf(not torch.version.hip, "Unpadded v1 MX scales are ROCm-only")
+    @runOnRocmArch(MI350_ARCH)
+    @parametrize("M", [16, 144, 1040])
+    def test_rocm_mx_v1_unpadded_scales(self, device, M) -> None:
+        # v1 runs hipBLASLt in NO_SWIZZLE mode, which reads only the first M
+        # (N) rows of row-major (M, K // 32) scales. The scales must therefore be
+        # accepted without the 128-row padding of the CUDA layout, and padding
+        # rows (NaN here) must not change the result.
+        N, K = 64, 256
+        a = torch.randn(M, K, device=device).to(torch.float8_e4m3fn)
+        b = torch.randn(N, K, device=device).to(torch.float8_e4m3fn)
+        exp_a = torch.randint(-2, 3, (M, K // 32), device=device).float()
+        exp_b = torch.randint(-2, 3, (N, K // 32), device=device).float()
+        scale_a = exp_a.exp2().to(torch.float8_e8m0fnu)
+        scale_b = exp_b.exp2().to(torch.float8_e8m0fnu)
+
+        def pad_rows_with_nan(scale, rows):
+            padded = torch.full((round_up(rows, 128), K // 32), 0xFF, device=device, dtype=torch.uint8)
+            padded[:rows] = scale.view(torch.uint8)
+            return padded.view(torch.float8_e8m0fnu)
+
+        got = torch._scaled_mm(a, b.t(), scale_a, scale_b, out_dtype=torch.bfloat16)
+        got_padded = torch._scaled_mm(
+            a, b.t(), pad_rows_with_nan(scale_a, M), pad_rows_with_nan(scale_b, N), out_dtype=torch.bfloat16
+        )
+        self.assertEqual(got, got_padded, atol=0, rtol=0)
+        ref = (a.float() * exp_a.exp2().repeat_interleave(32, 1)) @ (b.float() * exp_b.exp2().repeat_interleave(32, 1)).t()
+        torch.testing.assert_close(got.float(), ref, atol=1e-1, rtol=1.6e-2)
+
+        with FakeTensorMode() as mode:
+            fake_a, fake_b, fake_sa, fake_sb = [mode.from_tensor(t) for t in (a, b, scale_a, scale_b)]
+            fake = torch._scaled_mm(fake_a, fake_b.t(), fake_sa, fake_sb, out_dtype=torch.bfloat16)
+        self.assertEqual(fake.shape, (M, N))
+
+
+    @onlyAccelerator
+    @unittest.skipIf(not PLATFORM_SUPPORTS_MX_GEMM, mx_skip_msg)
     @unittest.skipIf(not torch.version.hip, "The MX scale layout is fixed by arch and ROCm version only on ROCm")
     @runOnRocmArch(MI350_ARCH)
     @parametrize("recipe", ["mxfp8", "mxfp4"])

@@ -152,6 +152,12 @@ int64_t blockwise_1x32_numel_32_8(int64_t rows, int64_t k_unpacked) {
       round_up<int64_t>(ceil_div<int64_t>(k_unpacked, 32), 8);
 }
 
+// Number of 1x32 e8m0 block scales hipBLASLt reads in NO_SWIZZLE
+// (VEC32_UE8M0) mode: a row-major (rows, K/32) matrix without row padding.
+int64_t blockwise_1x32_numel_unpadded(int64_t rows, int64_t k_unpacked) {
+  return rows * ceil_div<int64_t>(k_unpacked, 32);
+}
+
 // gfx950 hipBLASLt takes 1x32 block scales in the 32x8-tiled layout: MX FP4
 // from ROCm 7.13, MX FP8 from 7.14. Every other arch uses the default layout.
 bool prefers_swizzle_32_8([[maybe_unused]] const at::Tensor& t) {
@@ -239,7 +245,18 @@ bool is_blockwise_1x32_scaling(const at::Tensor& t, const at::Tensor& scale) {
   if (!isFloat8Type(t.scalar_type()) && !is_packed_fp4) {
     return false;
   }
-  return scale.numel() == blockwise_1x32_numel(t.size(0), blockwise_1x32_k_unpacked(t, t.size(1)));
+  const int64_t k_unpacked = blockwise_1x32_k_unpacked(t, t.size(1));
+#ifdef USE_ROCM
+  // v1 always runs hipBLASLt in NO_SWIZZLE mode, which on gfx950 reads the
+  // first `rows` rows of a row-major (rows, K/32) scale matrix. The 128-row
+  // padding of `blockwise_1x32_numel` only adds trailing rows that are never
+  // read, so the unpadded scales are the same layout and are accepted too.
+  if (scale.numel() == blockwise_1x32_numel_unpadded(t.size(0), k_unpacked) &&
+      at::detail::getCUDAHooks().isGPUArch({"gfx950"})) {
+    return true;
+  }
+#endif
+  return scale.numel() == blockwise_1x32_numel(t.size(0), k_unpacked);
 }
 
 bool is_blockwise_1x128_scaling(const at::Tensor& t, const at::Tensor& scale) {
@@ -296,6 +313,17 @@ std::pair<ScalingType, ScalingType> get_joint_scaling(
       return {lhs, rhs};
     }
   }
+#ifdef USE_ROCM
+  const int64_t mx_k_a = blockwise_1x32_k_unpacked(a, a.size(1));
+  const int64_t mx_k_b = blockwise_1x32_k_unpacked(b, b.size(0));
+  const std::string mx_scale_a_numel = std::to_string(blockwise_1x32_numel(a.size(0), mx_k_a)) +
+      " (or " + std::to_string(blockwise_1x32_numel_unpadded(a.size(0), mx_k_a)) + " unpadded on gfx950)";
+  const std::string mx_scale_b_numel = std::to_string(blockwise_1x32_numel(b.size(1), mx_k_b)) +
+      " (or " + std::to_string(blockwise_1x32_numel_unpadded(b.size(1), mx_k_b)) + " unpadded on gfx950)";
+#else
+  const int64_t mx_scale_a_numel = blockwise_1x32_numel(a.size(0), blockwise_1x32_k_unpacked(a, a.size(1)));
+  const int64_t mx_scale_b_numel = blockwise_1x32_numel(b.size(1), blockwise_1x32_k_unpacked(b, b.size(0)));
+#endif
   TORCH_CHECK(
     false,
     "Invalid scaling configuration.\n"
@@ -303,7 +331,7 @@ std::pair<ScalingType, ScalingType> get_joint_scaling(
     "- For RowWise scaling, a and b should be float8, scales should be float, scale_a should be (", a.size(0), ", 1) and scale_b should be (1, ", b.size(1), "), and both should be contiguous.\n"
     "- For BlockWise 1x128 scaling, a and b should be float8, scales should be float, scale_a should be (", a.size(0), ", ", ceil_div<int64_t>(a.size(1), 128), ") and scale_b should be (", ceil_div<int64_t>(b.size(0), 128), ", ", b.size(1), "), and both should be outer-dim-major.\n"
     "- For BlockWise 128x128 scaling, a and b should be float8, scales should be float, scale_a should be (", ceil_div<int64_t>(a.size(0), 128), ", ", ceil_div<int64_t>(a.size(1), 128), ") and scale_b should be (", ceil_div<int64_t>(b.size(0), 128), ", ", ceil_div<int64_t>(b.size(1), 128), "), and both should be near-inner-dim-major (with 16-byte aligned strides).\n"
-    "- For Blockwise 1x32 scaling, a and b should be float8, scales should be float8_e8m0fnu, scale_a should have ", blockwise_1x32_numel(a.size(0), blockwise_1x32_k_unpacked(a, a.size(1))), " elements and scale_b should have ", blockwise_1x32_numel(b.size(1), blockwise_1x32_k_unpacked(b, b.size(0))), " elements, and both should be contiguous.\n"
+    "- For Blockwise 1x32 scaling, a and b should be float8, scales should be float8_e8m0fnu, scale_a should have ", mx_scale_a_numel, " elements and scale_b should have ", mx_scale_b_numel, " elements, and both should be contiguous.\n"
     "- For Blockwise 1x16 scaling, a and b should be float4 (packed 2x), scales should be float8_e4m3fn, scale_a should have ", round_up<int64_t>(a.size(0), 128) * round_up<int64_t>(ceil_div<int64_t>(a.size(1) * 2, 16), 4), " elements and scale_b should have ", round_up<int64_t>(b.size(1), 128) * round_up<int64_t>(ceil_div<int64_t>(b.size(0) * 2, 16), 4), " elements, and both should be contiguous.\n"
     "Got a.dtype()=", a.scalar_type(), ", scale_a.dtype()=", scale_a.scalar_type(), ", scale_a.size()=", scale_a.sizes(), ", scale_a.stride()=", scale_a.strides(), ", ",
     "b.dtype()=", b.scalar_type(), ", scale_b.dtype()=", scale_b.scalar_type(), ", scale_b.size()=", scale_b.sizes(), " and scale_b.stride()=", scale_b.strides()
