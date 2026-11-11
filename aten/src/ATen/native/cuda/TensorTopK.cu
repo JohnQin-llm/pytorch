@@ -1711,7 +1711,7 @@ bool should_use_multiblock(int64_t num_slices, int64_t slice_size) {
       (num_slices > 4000 && slice_size >= 400);
 }
 
-bool should_use_warp_topk(int64_t slice_size, int64_t k) {
+bool should_use_warp_topk(int64_t num_slices, int64_t slice_size, int64_t k, size_t element_size) {
 #if !defined(USE_ROCM) || !HAS_WARP_MERGE_SORT()
   return false;
 #else
@@ -1721,7 +1721,15 @@ bool should_use_warp_topk(int64_t slice_size, int64_t k) {
   // Use WarpMergeSort for small slices
   // WarpMergeSort has O(n log n) complexity and is efficient for small sizes
   // Conservative threshold: slice_size <= 256 shows consistent improvements
-  return slice_size <= 256;
+  if (slice_size <= 256) {
+    return true;
+  }
+  // 8-byte keys (int64, double) need 32 two-bit passes in radixSelect and do not
+  // take its register-resident path, so up to MAX_WARP_TOPK_SLICE the warp sort
+  // (one wavefront per slice) is faster once there are enough slices to fill the
+  // GPU: 1.03x-2.7x on MI355X from 2048 slices up; with fewer slices the
+  // single-block path can be slightly faster.
+  return element_size == 8 && num_slices >= 2048;
 #endif
 }
 
@@ -1753,7 +1761,7 @@ void launch_gather_topk_kernel(
 
 #if defined(USE_ROCM) && HAS_WARP_MERGE_SORT()
 #define RUN_MB(INDEX_T, DIM)                                              \
-  if (should_use_warp_topk(sliceSize, k)) {                               \
+  if (should_use_warp_topk(numInputSlices, sliceSize, k, sizeof(scalar_t))) { \
     RUN_K(INDEX_T, DIM, warptopk::launch);                                \
   } else if (should_use_multiblock(numInputSlices, sliceSize)) {          \
     RUN_K(INDEX_T, DIM, mbtopk::launch);                                  \

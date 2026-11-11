@@ -938,6 +938,28 @@ class TestSortAndSelectDevice(TestCase):
                         f"dtype={dtype} largest={largest}",
                     )
 
+    @dtypes(torch.int64, torch.float64, torch.float32)
+    def test_topk_many_mid_size_slices(self, device, dtype):
+        # Many slices of 257-512 elements. On ROCm, 8-byte dtypes take the
+        # warpMergeSortTopK path for these sizes once there are enough slices,
+        # other dtypes stay on the single-block radix select. Values are
+        # distinct, so values and indices must match a full sort exactly.
+        torch.manual_seed(0)
+        num_slices = 2048
+        for slice_size in (257, 300, 384, 511, 512):
+            a = torch.rand(num_slices, slice_size, device=device).argsort(dim=1)
+            a = (a - slice_size // 2).to(dtype)
+            for largest, k, transpose in product(
+                (True, False), (1, 8, slice_size // 2, slice_size), (False, True)
+            ):
+                msg = f"{slice_size=} {k=} {largest=} {transpose=}"
+                x = a.t().contiguous() if transpose else a
+                dim = 0 if transpose else 1
+                vals, idx = x.topk(k, dim=dim, largest=largest)
+                ref_vals, ref_idx = x.sort(dim=dim, descending=largest)
+                self.assertEqual(vals, ref_vals.narrow(dim, 0, k), msg=msg)
+                self.assertEqual(idx, ref_idx.narrow(dim, 0, k), msg=msg)
+
     @dtypes(torch.bfloat16, torch.half)
     def test_topk_lower_precision(self, device, dtype):
         small = 10
