@@ -170,7 +170,9 @@ const Tensor& offs,
 const Tensor& offs_cpu,
 Tensor& out) {
   const int64_t num_groups = offs_cpu.size(0);
-  if (!mat_a.is_cuda() || num_groups < 16 || out.scalar_type() != mat_a.scalar_type()) {
+  // The output is written through row-packed views (ldc == N, packed batch stride). ROCm allocates it
+  // contiguous; anything else stays on the loop.
+  if (!mat_a.is_cuda() || num_groups < 16 || out.scalar_type() != mat_a.scalar_type() || !out.is_contiguous()) {
     return false;
   }
   const int32_t* group_ends = offs_cpu.const_data_ptr<int32_t>();

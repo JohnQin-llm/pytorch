@@ -12821,16 +12821,18 @@ class TestGroupedMM(TestCase):
     @parametrize("strided", [False, True])
     @parametrize("a_row_major", [False, True])
     @parametrize("b_row_major", [False, True])
-    @parametrize("group_sizes,unused_rows", [
-        subtest(([24] * 16, 0), name="equal"),
-        subtest(([8 * (1 + i % 3) for i in range(7)] + [0] + [8 * (1 + i % 3) for i in range(24)], 8), name="unequal"),
-        subtest(([3 + (5 * i) % 9 for i in range(19)] + [0, 7], 5), name="unequal_unaligned"),
+    # The unaligned N cases give an output row stride that is not a multiple of 16 bytes.
+    @parametrize("group_sizes,unused_rows,n", [
+        subtest(([24] * 16, 0, 48), name="equal"),
+        subtest(([24] * 16, 0, 36), name="equal_unaligned_n"),
+        subtest(([8 * (1 + i % 3) for i in range(7)] + [0] + [8 * (1 + i % 3) for i in range(24)], 8, 48), name="unequal"),
+        subtest(([3 + (5 * i) % 9 for i in range(19)] + [0, 7], 5, 36), name="unequal_unaligned"),
     ])
     @dtypes(torch.bfloat16, torch.float32, torch.float16)
     def test_grouped_gemm_2d_3d_many_groups(self, device, strided, a_row_major, b_row_major, group_sizes, unused_rows,
-                                           dtype):
+                                           n, dtype):
         offsets = list(itertools.accumulate(group_sizes))
-        a_shape, b_shape = (offsets[-1] + unused_rows, 32), (len(group_sizes), 48, 32)
+        a_shape, b_shape = (offsets[-1] + unused_rows, 32), (len(group_sizes), n, 32)
         self._check_grouped_gemm(device, strided, a_row_major, b_row_major, a_shape, b_shape, offsets, True, dtype)
         if torch.version.hip and self.device_type == "cuda" and not any(
                 os.environ.get(v) == "1" for v in ("ROCM_ALLOW_GROUP_GEMM_CK", "ROCM_ALLOW_GROUP_GEMM_CK_TILE")):
