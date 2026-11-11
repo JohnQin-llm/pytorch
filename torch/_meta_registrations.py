@@ -7478,10 +7478,20 @@ def _check_scaled_mm_sizes(
                     block_size_mn * ceil_div(n, block_size_mn) * padded_num_k_blocks
                 )
 
+            a_size_ok = scale_a.numel() == expected_a_size
+            b_size_ok = scale_b.numel() == expected_b_size
             if (
-                scale_a.numel() == expected_a_size
-                and scale_b.numel() == expected_b_size
+                torch.version.hip is not None
+                and device_hint(self) == "cuda"
+                and block_size_k == 32
             ):
+                # ROCm runs v1 MX in hipBLASLt NO_SWIZZLE mode, which reads only
+                # the first m (n) rows of row-major scales, so the unpadded count
+                # is accepted as well (`blockwise_1x32_numel_unpadded`; the eager
+                # op accepts it on gfx950 only).
+                a_size_ok = a_size_ok or scale_a.numel() == num_k_blocks * m
+                b_size_ok = b_size_ok or scale_b.numel() == num_k_blocks * n
+            if a_size_ok and b_size_ok:
                 if device_hint(self) == "xpu":
                     torch._check(
                         scale_a.is_contiguous() or scale_a.t().is_contiguous(),
