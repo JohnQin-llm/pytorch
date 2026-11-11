@@ -2357,6 +2357,38 @@ class TestSDPAFailureModes(NNTestCase):
         self.assertEqual(value.grad, v_cpu.grad, atol=2e-3, rtol=1e-4)
 
     @onlyAccelerator
+    @unittest.skipIf(not TEST_WITH_ROCM, "Flash and mem-efficient attention share the AOTriton backward only on ROCm")
+    @unittest.skipIf(not PLATFORM_SUPPORTS_FLASH_ATTENTION or not PLATFORM_SUPPORTS_MEM_EFF_ATTENTION,
+                     "Requires flash and mem-efficient attention")
+    @parametrize("is_causal", [False, True])
+    def test_flash_attention_backward_same_aotriton_backend_as_mem_eff(self, device, is_causal):
+        # Flash used to leave attn_bwd_params.B/DB default-constructed. AOTriton's
+        # TensorView does not initialize its strides, so its ASM backward rejected
+        # the indeterminate DB ("large tensor args.DB") and flash always fell back
+        # to the slower Triton split kernels, while mem-efficient, which passes null
+        # tensors, got the ASM kernel for the same problem.
+        from torch.profiler import profile, ProfilerActivity
+        torch.manual_seed(0)
+        q, k, v = (torch.randn(2, 8, 2048, 128, device=device, dtype=torch.bfloat16, requires_grad=True)
+                   for _ in range(3))
+        grad_out = torch.randn(2, 8, 2048, 128, device=device, dtype=torch.bfloat16)
+
+        def backward(backend):
+            with sdpa_kernel(backend):
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+            with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                grads = torch.autograd.grad(out, (q, k, v), grad_out)
+                torch.cuda.synchronize()
+            uses_split = any(e.name.split(".")[0] in ("bwd_kernel_dk_dv", "bwd_kernel_dq") for e in prof.events())
+            return grads, uses_split
+
+        flash_grads, flash_uses_split = backward(SDPBackend.FLASH_ATTENTION)
+        eff_grads, eff_uses_split = backward(SDPBackend.EFFICIENT_ATTENTION)
+        self.assertEqual(flash_uses_split, eff_uses_split)
+        for g_flash, g_eff in zip(flash_grads, eff_grads):
+            self.assertEqual(g_flash, g_eff, atol=2e-2, rtol=2e-2)
+
+    @onlyAccelerator
     @unittest.skipIf(not PLATFORM_SUPPORTS_MEM_EFF_ATTENTION, "Does not support Efficient Attention")
     @unittest.skipIf(not TEST_WITH_ROCM, "CUDA chunks launches without splitting the RNG state")
     def test_mem_eff_attention_fail_with_batch_size_geq_65536_error(self, device):

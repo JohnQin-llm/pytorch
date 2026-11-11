@@ -685,6 +685,16 @@ mha_bwd_aot(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x hea
   params.Q = mk_input_aotensor(q_t, "q");
   params.K = mk_input_aotensor(k_t, "k");
   params.V = mk_input_aotensor(v_t, "v");
+  // attn_bwd_params has a user-provided (empty) constructor and AOTriton's
+  // TensorView does not initialize its sizes/strides, so B and DB must be set
+  // explicitly. Left unset, DB carries indeterminate strides, AOTriton's ASM
+  // (aiter) backward rejects the call ("large tensor args.DB") and it falls
+  // back to the 2-3x slower Triton split kernels. Same as the null bias that
+  // _efficient_attention_backward passes.
+  using sdp::aotriton_adapter::cast_dtype;
+  aotriton::TensorView<4> empty_bias(0, {0,0,0,0}, {0,0,0,0}, cast_dtype(q.dtype()));
+  params.B = empty_bias;
+  params.DB = empty_bias;
   params.Sm_scale = softmax_scale;
   params.Out = mk_input_aotensor(out_t, "out");
   params.DO = mk_input_aotensor(dout_t, "dout");
@@ -882,6 +892,11 @@ mha_varlen_bwd_aot(const at::Tensor &dout,  // total_q x num_heads, x head_size
     params.Q = mk_input_aotensor(q_padded, "q");
     params.K = mk_input_aotensor(k_padded, "k");
     params.V = mk_input_aotensor(v_padded, "v");
+    // B and DB must be explicit null tensors, see mha_bwd_aot.
+    using sdp::aotriton_adapter::cast_dtype;
+    aotriton::TensorView<4> empty_bias(0, {0,0,0,0}, {0,0,0,0}, cast_dtype(q.dtype()));
+    params.B = empty_bias;
+    params.DB = empty_bias;
     params.Sm_scale = softmax_scale;
     params.Out = mk_input_aotensor(out_t, "out");
     params.DO = mk_input_aotensor(dout_t, "dout");
