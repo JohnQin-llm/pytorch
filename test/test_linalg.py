@@ -12815,6 +12815,34 @@ class TestGroupedMM(TestCase):
         offs = torch.tensor(offsets, device=device, dtype=torch.int32)
         self.grouped_mm_helper(a, b, offs)
 
+    # MoE-like 2d x 3d cases: many groups of similar size. ROCm runs these as one bmm over the groups padded to
+    # the largest one instead of one GEMM per group, so also cover an empty group and rows past the last offset.
+    @skipCUDAIf(not SM80OrLater, "Grouped gemm supported only on SM80 or greater")
+    @parametrize("strided", [False, True])
+    @parametrize("a_row_major", [False, True])
+    @parametrize("b_row_major", [False, True])
+    @parametrize("group_sizes,unused_rows", [
+        subtest(([24] * 16, 0), name="equal"),
+        subtest(([8 * (1 + i % 3) for i in range(7)] + [0] + [8 * (1 + i % 3) for i in range(24)], 8), name="unequal"),
+        subtest(([3 + (5 * i) % 9 for i in range(19)] + [0, 7], 5), name="unequal_unaligned"),
+    ])
+    @dtypes(torch.bfloat16, torch.float32, torch.float16)
+    def test_grouped_gemm_2d_3d_many_groups(self, device, strided, a_row_major, b_row_major, group_sizes, unused_rows,
+                                           dtype):
+        offsets = list(itertools.accumulate(group_sizes))
+        a_shape, b_shape = (offsets[-1] + unused_rows, 32), (len(group_sizes), 48, 32)
+        self._check_grouped_gemm(device, strided, a_row_major, b_row_major, a_shape, b_shape, offsets, True, dtype)
+        if torch.version.hip and self.device_type == "cuda" and not any(
+                os.environ.get(v) == "1" for v in ("ROCM_ALLOW_GROUP_GEMM_CK", "ROCM_ALLOW_GROUP_GEMM_CK_TILE")):
+            a = self._make_grouped_mm_matrix(a_shape, a_row_major, device, dtype, strided)
+            b = self._make_grouped_mm_matrix(b_shape, b_row_major, device, dtype, strided)
+            offs = torch.tensor(offsets, device=device, dtype=torch.int32)
+            with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+                F.grouped_mm(a, b.transpose(-2, -1), offs=offs)
+            ops = [e.key for e in prof.key_averages()]
+            self.assertIn("aten::bmm", ops)
+            self.assertNotIn("aten::mm", ops)
+
     @onlyOn(("cuda", "mps"))
     @skipCUDAIf(not SM80OrLater, "Grouped gemm supported only on SM80 or greater")
     @dtypes(torch.bfloat16)
